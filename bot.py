@@ -11,21 +11,14 @@ from botbuilder.schema import SuggestedActions, CardAction, ActionTypes
 class ReportBot(ActivityHandler):
     """
     Un bot que saluda al usuario y ofrece opciones iniciales: 'Generar la presentación' y 'Revisar agenda'.
-    Genera reportes usando una Azure Function y muestra la agenda de la próxima reunión desde un archivo JSON.
+    Genera reportes usando una Azure Function con la agenda de la próxima reunión desde un archivo JSON.
     """
 
     def __init__(self, conversation_state: ConversationState):
-        """
-        Inicializa el ReportBot con estado de conversación y configuración de Azure File Storage.
-        
-        Args:
-            conversation_state (ConversationState): Usado para rastrear datos a nivel de conversación.
-        """
         super(ReportBot, self).__init__()
         self.conversation_state = conversation_state
         self.conversation_data = self.conversation_state.create_property("conversation_data")
         
-        # Configuración de Azure File Storage
         self.storage_account_name = os.getenv("STORAGE_ACCOUNT_NAME")
         self.sas_token = os.getenv("SAS_TOKEN")
         self.file_share_name = os.getenv("FILE_SHARE_NAME")
@@ -36,15 +29,6 @@ class ReportBot(ActivityHandler):
         self.share_client = self.service_client.get_share_client(self.file_share_name)
 
     async def download_file_from_share(self, filename: str) -> pd.DataFrame:
-        """
-        Descarga y lee un archivo Excel desde Azure File Storage.
-        
-        Args:
-            filename (str): Nombre del archivo a descargar.
-        
-        Returns:
-            pd.DataFrame: DataFrame con los datos del Excel.
-        """
         directory_client = self.share_client.get_directory_client(self.inputs_directory)
         file_client = directory_client.get_file_client(filename)
         stream = file_client.download_file()
@@ -53,15 +37,6 @@ class ReportBot(ActivityHandler):
         return df
 
     async def download_json_from_share(self, filename: str) -> dict:
-        """
-        Descarga y lee un archivo JSON desde Azure File Storage.
-        
-        Args:
-            filename (str): Nombre del archivo a descargar.
-        
-        Returns:
-            dict: Contenido del archivo JSON.
-        """
         directory_client = self.share_client.get_directory_client(self.inputs_directory)
         file_client = directory_client.get_file_client(filename)
         stream = file_client.download_file()
@@ -69,14 +44,44 @@ class ReportBot(ActivityHandler):
             data = json.load(f)
         return data
 
-    async def on_members_added_activity(self, members_added, turn_context: TurnContext):
+    async def get_next_meeting_agenda(self, turn_context: TurnContext) -> list:
         """
-        Saluda a nuevos usuarios y ofrece opciones iniciales.
+        Obtiene la agenda de la próxima reunión desde agenda.json.
         
         Args:
-            members_added (list): Lista de miembros añadidos a la conversación.
             turn_context (TurnContext): Contexto del turno actual.
+        
+        Returns:
+            list: Lista de puntos de la agenda de la próxima reunión.
         """
+        try:
+            agenda_data = await self.download_json_from_share("agenda.json")
+            meetings = agenda_data.get("meetings", [])
+            if not meetings:
+                await turn_context.send_activity("No hay reuniones programadas en la agenda.")
+                return []
+            current_time = datetime.utcnow()
+            future_meetings = [
+                m for m in meetings
+                if datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ") > current_time
+            ]
+            if not future_meetings:
+                await turn_context.send_activity("No hay reuniones futuras en la agenda.")
+                return []
+            next_meeting = min(
+                future_meetings,
+                key=lambda m: datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ")
+            )
+            return next_meeting.get("body", {}).get("agenda", [])
+        except Exception as e:
+            error_msg = str(e)
+            if "ResourceNotFound" in error_msg:
+                await turn_context.send_activity("No se encontró el archivo de agenda en Azure File Storage. Contacta al administrador.")
+            else:
+                await turn_context.send_activity(f"Error al leer la agenda: {error_msg}.")
+            return []
+
+    async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         for member in members_added:
             if member.id != turn_context.activity.recipient.id:
                 await turn_context.send_activity("¡Hola! ¿Qué te gustaría hacer hoy?")
@@ -89,16 +94,9 @@ class ReportBot(ActivityHandler):
                 )
 
     async def on_message_activity(self, turn_context: TurnContext):
-        """
-        Procesa mensajes del usuario, manejando opciones iniciales y los flujos correspondientes.
-        
-        Args:
-            turn_context (TurnContext): Contexto del turno actual.
-        """
         text = turn_context.activity.text.strip()
         conv_data = await self.conversation_data.get(turn_context, {"quarter": None, "leader_id": None, "state": "initial"})
         
-        # Estado inicial: manejar la selección de opción
         if conv_data["state"] == "initial":
             if text == "Generar la presentación":
                 conv_data["state"] = "selecting_quarter"
@@ -146,7 +144,7 @@ class ReportBot(ActivityHandler):
                                 CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
                             ]
                             conv_data["state"] = "awaiting_modification_choice"
-                            conv_data["next_meeting"] = next_meeting
+                            conv_data["next_meeting_agenda"] = agenda_items  # Guardar la agenda para usarla en el payload
                             await self.conversation_data.set(turn_context, conv_data)
                             await turn_context.send_activity(
                                 MessageFactory.suggested_actions(actions, "Selecciona una opción:")
@@ -161,11 +159,9 @@ class ReportBot(ActivityHandler):
                 await turn_context.send_activity("Por favor, selecciona una opción válida: 'Generar la presentación' o 'Revisar agenda'.")
             return
 
-        # Estado: esperando elección sobre modificaciones
         if conv_data["state"] == "awaiting_modification_choice":
             if text == "Generar la presentación":
                 conv_data["state"] = "selecting_quarter"
-                conv_data.pop("next_meeting", None)
                 await self.conversation_data.set(turn_context, conv_data)
                 await turn_context.send_activity("¡Genial! Para el reporte, ¿qué trimestre desea usar?")
                 actions = [
@@ -185,19 +181,20 @@ class ReportBot(ActivityHandler):
                 await turn_context.send_activity("Por favor, selecciona una opción válida: 'Realizar modificaciones' o 'Generar la presentación'.")
             return
 
-        # Estado: seleccionando trimestre
         if conv_data["state"] == "selecting_quarter":
             text_upper = text.upper()
             if text_upper in ["Q1", "Q2", "Q3", "Q4"]:
                 conv_data["quarter"] = text_upper
                 conv_data["state"] = "selecting_leader_id"
+                # Si no hay agenda guardada, obtenerla del JSON
+                if "next_meeting_agenda" not in conv_data or not conv_data["next_meeting_agenda"]:
+                    conv_data["next_meeting_agenda"] = await self.get_next_meeting_agenda(turn_context)
                 await self.conversation_data.set(turn_context, conv_data)
                 await turn_context.send_activity(f"Seleccionaste {text_upper}. Ahora, por favor ingresa tu ID de líder.")
             else:
                 await turn_context.send_activity("Por favor, selecciona un trimestre válido (Q1, Q2, Q3 o Q4).")
             return
         
-        # Estado: seleccionando leader_id
         if conv_data["state"] == "selecting_leader_id":
             try:
                 users_df = await self.download_file_from_share("Tabla_de_Usuarios_Actualizada.xlsx")
@@ -206,10 +203,11 @@ class ReportBot(ActivityHandler):
                     conv_data["leader_id"] = text
                     await turn_context.send_activity(f"¡Genial! Generando tu reporte para {conv_data['quarter']} con el ID de líder {text}...")
                     await turn_context.send_activity("Procesando tu reporte, por favor espera...")
-                    await self.call_azure_function(turn_context, conv_data["quarter"], conv_data["leader_id"])
+                    await self.call_azure_function(turn_context, conv_data["quarter"], conv_data["leader_id"], conv_data.get("next_meeting_agenda", []))
                     conv_data["quarter"] = None
                     conv_data["leader_id"] = None
                     conv_data["state"] = "initial"
+                    conv_data.pop("next_meeting_agenda", None)
                     await self.conversation_data.set(turn_context, conv_data)
                     await turn_context.send_activity("Reporte generado. ¿Qué más puedo hacer por ti?")
                     actions = [
@@ -233,21 +231,21 @@ class ReportBot(ActivityHandler):
                     await turn_context.send_activity(f"Error al acceder a los datos de usuarios: {error_msg}. Intenta de nuevo.")
             return
         
-        # Estado: modificando agenda (placeholder)
         if conv_data["state"] == "modifying_agenda":
             await turn_context.send_activity("Esperando instrucciones para modificar la agenda. ¿Qué quieres hacer?")
             return
         
         await turn_context.send_activity("No entendí eso. Por favor selecciona una opción o sigue el flujo.")
 
-    async def call_azure_function(self, turn_context: TurnContext, quarter: str, leader_id: str):
+    async def call_azure_function(self, turn_context: TurnContext, quarter: str, leader_id: str, agenda: list):
         """
-        Llama a la Azure Function para generar el reporte y envía el resultado al usuario.
+        Llama a la Azure Function para generar el reporte con la agenda de la próxima reunión.
         
         Args:
             turn_context (TurnContext): Contexto del turno actual.
             quarter (str): Trimestre seleccionado (ej. 'Q2').
             leader_id (str): ID de líder ingresado.
+            agenda (list): Lista de puntos de la agenda de la próxima reunión.
         """
         azure_function_url = os.getenv("AZURE_FUNCTION_URL", "https://<your-function-app>.azurewebsites.net/api/generate_presentation")
         auth_token = os.getenv("AZURE_FUNCTION_AUTH_TOKEN", "<your-auth-token>")
@@ -255,14 +253,14 @@ class ReportBot(ActivityHandler):
         payload = {
             "q": quarter,
             "matricula_lider": leader_id,
-            "agenda": [
+            "agenda": agenda if agenda else [
                 "Punto 1 de la agenda",
                 "Punto 2 de la agenda",
                 "Punto 3 de la agenda",
                 "Punto 8 de la agenda",
                 "Punto 9 de la agenda",
                 "Punto 10 de la agenda"
-            ]
+            ]  # Fallback si no hay agenda
         }
         
         try:
