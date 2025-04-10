@@ -14,7 +14,7 @@ class ReportBot(ActivityHandler):
     """
     Un bot que saluda al usuario y ofrece opciones iniciales: 'Generar la presentación' y 'Revisar agenda'.
     Permite modificar la agenda de la próxima reunión usando Azure Open AI y genera reportes con la agenda actualizada.
-    Incluye los nombres de nuevos miembros del equipo en el payload para la Azure Function.
+    Usa una matrícula de líder desde una variable de entorno.
     """
 
     def __init__(self, conversation_state: ConversationState):
@@ -40,6 +40,11 @@ class ReportBot(ActivityHandler):
             endpoint=f"{base_endpoint}/openai/deployments/{deployment_name}",
             credential=AzureKeyCredential(api_key)
         )
+
+        # Obtener la matrícula del líder desde la variable de entorno
+        self.leader_id = os.getenv("LEADER_ID")
+        if not self.leader_id:
+            raise ValueError("La variable de entorno LEADER_ID no está configurada.")
 
     async def download_file_from_share(self, filename: str) -> pd.DataFrame:
         directory_client = self.share_client.get_directory_client(self.inputs_directory)
@@ -111,22 +116,10 @@ class ReportBot(ActivityHandler):
             return ["Error al generar puntos de agenda."]
 
     async def get_new_team_members(self, leader_id: str) -> list:
-        """
-        Obtiene los nombres completos de los nuevos miembros del equipo de un líder.
-
-        Args:
-            leader_id (str): Matrícula del líder.
-
-        Returns:
-            list: Lista de nombres completos de los nuevos miembros.
-        """
         try:
             users_df = await self.download_file_from_share("Tabla_de_Usuarios_Actualizada.xlsx")
-            # Filtrar miembros del equipo del líder
-            team_members = users_df[users_df['Matricula Lider'].astype(str) == leader_id]
-            # Filtrar nuevos miembros (TRUE en "Nuevo miembro")
+            team_members = users_df[users_df['Matrícula Líder'].astype(str) == leader_id]
             new_members = team_members[team_members['Nuevo miembro'] == True]  # noqa: E712
-            # Obtener nombres completos
             new_member_names = new_members['Nombre Completo'].tolist()
             return new_member_names
         except Exception as e:
@@ -147,7 +140,7 @@ class ReportBot(ActivityHandler):
 
     async def on_message_activity(self, turn_context: TurnContext):
         text = turn_context.activity.text.strip()
-        conv_data = await self.conversation_data.get(turn_context, {"quarter": None, "leader_id": None, "state": "initial", "next_meeting_agenda": None})
+        conv_data = await self.conversation_data.get(turn_context, {"quarter": None, "state": "initial", "next_meeting_agenda": None})
 
         if conv_data["state"] == "initial":
             if text == "Generar la presentación":
@@ -283,47 +276,27 @@ class ReportBot(ActivityHandler):
             text_upper = text.upper()
             if text_upper in ["Q1", "Q2", "Q3", "Q4"]:
                 conv_data["quarter"] = text_upper
-                conv_data["state"] = "selecting_leader_id"
+                # Obtener los nombres de los nuevos miembros usando el leader_id de la variable de entorno
+                new_members = await self.get_new_team_members(self.leader_id)
                 if "next_meeting_agenda" not in conv_data or not conv_data["next_meeting_agenda"]:
                     conv_data["next_meeting_agenda"] = await self.get_next_meeting_agenda(turn_context)
+                await turn_context.send_activity(f"¡Genial! Generando tu reporte para {text_upper} con el ID de líder {self.leader_id}...")
+                await turn_context.send_activity("Procesando tu reporte, por favor espera...")
+                await self.call_azure_function(turn_context, conv_data["quarter"], self.leader_id, conv_data.get("next_meeting_agenda", []), new_members)
+                conv_data["quarter"] = None
+                conv_data["state"] = "initial"
+                conv_data.pop("next_meeting_agenda", None)
                 await self.conversation_data.set(turn_context, conv_data)
-                await turn_context.send_activity(f"Seleccionaste {text_upper}. Ahora, por favor ingresa tu ID de líder.")
+                await turn_context.send_activity("Reporte generado. ¿Qué más puedo hacer por ti?")
+                actions = [
+                    CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
+                    CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
+                ]
+                await turn_context.send_activity(
+                    MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
+                )
             else:
                 await turn_context.send_activity("Por favor, selecciona un trimestre válido (Q1, Q2, Q3 o Q4).")
-            return
-
-        if conv_data["state"] == "selecting_leader_id":
-            try:
-                users_df = await self.download_file_from_share("Tabla_de_Usuarios_Actualizada.xlsx")
-                valid_leaders = users_df['Matricula Lider'].astype(str).tolist()
-                if text in valid_leaders:
-                    conv_data["leader_id"] = text
-                    # Obtener los nombres de los nuevos miembros
-                    new_members = await self.get_new_team_members(text)
-                    await turn_context.send_activity(f"¡Genial! Generando tu reporte para {conv_data['quarter']} con el ID de líder {text}...")
-                    await turn_context.send_activity("Procesando tu reporte, por favor espera...")
-                    await self.call_azure_function(turn_context, conv_data["quarter"], conv_data["leader_id"], conv_data.get("next_meeting_agenda", []), new_members)
-                    conv_data["quarter"] = None
-                    conv_data["leader_id"] = None
-                    conv_data["state"] = "initial"
-                    conv_data.pop("next_meeting_agenda", None)
-                    await self.conversation_data.set(turn_context, conv_data)
-                    await turn_context.send_activity("Reporte generado. ¿Qué más puedo hacer por ti?")
-                    actions = [
-                        CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
-                        CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
-                    ]
-                    await turn_context.send_activity(
-                        MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
-                    )
-                else:
-                    await turn_context.send_activity(f"El ID de líder {text} no se encontró en la tabla de usuarios. Intenta de nuevo.")
-            except Exception as e:
-                error_msg = str(e)
-                if "ResourceNotFound" in error_msg:
-                    await turn_context.send_activity("No se pudo encontrar el archivo de usuarios en Azure File Storage. Contacta al administrador.")
-                else:
-                    await turn_context.send_activity(f"Error al acceder a los datos de usuarios: {error_msg}. Intenta de nuevo.")
             return
 
         await turn_context.send_activity("No entendí eso. Por favor selecciona una opción o sigue el flujo.")
