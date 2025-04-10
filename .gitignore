@@ -1,14 +1,20 @@
-# Carpetas de Python
+# Ignorar bytecode de Python
 __pycache__/
 *.py[cod]
 
-# Entornos virtuales
+# Ignorar entornos virtuales
 venv/
 .venv/
+ENV/
+env/
 
-# Archivos de entorno
+# Ignorar archivos de entorno
 .env
 variables.env
 
-# Otros
+# (Opcional) Ignorar la carpeta de configuración de VS Code 
+# (Solo si NO quieres compartir configuraciones de depuración con tu equipo)
+.vscode/
+
+# Otros archivos que no quieras subir
 *.log
