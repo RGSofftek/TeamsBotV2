@@ -10,9 +10,16 @@ from botbuilder.schema import SuggestedActions, CardAction, ActionTypes
 class ReportBot(ActivityHandler):
     """
     Un bot que saluda al usuario y ofrece opciones iniciales: 'Generar la presentación' y 'Revisar agenda'.
+    Genera reportes usando una Azure Function y muestra agendas desde un archivo JSON.
     """
 
     def __init__(self, conversation_state: ConversationState):
+        """
+        Inicializa el ReportBot con estado de conversación y configuración de Azure File Storage.
+        
+        Args:
+            conversation_state (ConversationState): Usado para rastrear datos a nivel de conversación.
+        """
         super(ReportBot, self).__init__()
         self.conversation_state = conversation_state
         self.conversation_data = self.conversation_state.create_property("conversation_data")
@@ -28,6 +35,15 @@ class ReportBot(ActivityHandler):
         self.share_client = self.service_client.get_share_client(self.file_share_name)
 
     async def download_file_from_share(self, filename: str) -> pd.DataFrame:
+        """
+        Descarga y lee un archivo Excel desde Azure File Storage.
+        
+        Args:
+            filename (str): Nombre del archivo a descargar.
+        
+        Returns:
+            pd.DataFrame: DataFrame con los datos del Excel.
+        """
         directory_client = self.share_client.get_directory_client(self.inputs_directory)
         file_client = directory_client.get_file_client(filename)
         stream = file_client.download_file()
@@ -35,9 +51,30 @@ class ReportBot(ActivityHandler):
             df = pd.read_excel(f, engine="openpyxl")
         return df
 
+    async def download_json_from_share(self, filename: str) -> dict:
+        """
+        Descarga y lee un archivo JSON desde Azure File Storage.
+        
+        Args:
+            filename (str): Nombre del archivo a descargar.
+        
+        Returns:
+            dict: Contenido del archivo JSON.
+        """
+        directory_client = self.share_client.get_directory_client(self.inputs_directory)
+        file_client = directory_client.get_file_client(filename)
+        stream = file_client.download_file()
+        with BytesIO(stream.readall()) as f:
+            data = json.load(f)
+        return data
+
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         """
         Saluda a nuevos usuarios y ofrece opciones iniciales.
+        
+        Args:
+            members_added (list): Lista de miembros añadidos a la conversación.
+            turn_context (TurnContext): Contexto del turno actual.
         """
         for member in members_added:
             if member.id != turn_context.activity.recipient.id:
@@ -52,7 +89,10 @@ class ReportBot(ActivityHandler):
 
     async def on_message_activity(self, turn_context: TurnContext):
         """
-        Procesa mensajes del usuario, manejando opciones iniciales y el flujo de generación de presentación.
+        Procesa mensajes del usuario, manejando opciones iniciales y los flujos correspondientes.
+        
+        Args:
+            turn_context (TurnContext): Contexto del turno actual.
         """
         text = turn_context.activity.text.strip()
         conv_data = await self.conversation_data.get(turn_context, {"quarter": None, "leader_id": None, "state": "initial"})
@@ -73,10 +113,41 @@ class ReportBot(ActivityHandler):
                     MessageFactory.suggested_actions(actions, "Por favor, selecciona un trimestre:")
                 )
             elif text == "Revisar agenda":
-                # Placeholder para la funcionalidad de revisar agenda
-                await turn_context.send_activity("Aquí está tu agenda (funcionalidad en desarrollo). ¿Qué más puedo hacer por ti?")
-                # Mantener el estado inicial para permitir otra selección
-                await self.conversation_data.set(turn_context, conv_data)
+                try:
+                    # Descargar el archivo JSON
+                    agenda_data = await self.download_json_from_share("agenda.json")
+                    meetings = agenda_data.get("meetings", [])
+                    
+                    if not meetings:
+                        await turn_context.send_activity("No hay reuniones programadas en la agenda.")
+                    else:
+                        # Construir el mensaje con la agenda
+                        agenda_message = "Aquí está tu agenda:\n\n"
+                        for meeting in meetings:
+                            subject = meeting.get("subject", "Sin título")
+                            start = meeting.get("start", "Sin hora")
+                            agenda_items = meeting.get("body", {}).get("agenda", [])
+                            agenda_message += f"**{subject}** ({start}):\n"
+                            for item in agenda_items:
+                                agenda_message += f"- {item}\n"
+                            agenda_message += "\n"
+                        await turn_context.send_activity(agenda_message)
+                    # Mantener el estado inicial para permitir otra selección
+                    await self.conversation_data.set(turn_context, conv_data)
+                    # Ofrecer opciones nuevamente
+                    actions = [
+                        CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
+                        CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
+                    ]
+                    await turn_context.send_activity(
+                        MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
+                    )
+                except Exception as e:
+                    error_msg = str(e)
+                    if "ResourceNotFound" in error_msg:
+                        await turn_context.send_activity("No se encontró el archivo de agenda en Azure File Storage. Contacta al administrador.")
+                    else:
+                        await turn_context.send_activity(f"Error al leer la agenda: {error_msg}. Intenta de nuevo.")
             else:
                 await turn_context.send_activity("Por favor, selecciona una opción válida: 'Generar la presentación' o 'Revisar agenda'.")
             return
@@ -133,20 +204,25 @@ class ReportBot(ActivityHandler):
         await turn_context.send_activity("No entendí eso. Por favor selecciona una opción o sigue el flujo.")
 
     async def call_azure_function(self, turn_context: TurnContext, quarter: str, leader_id: str):
+        """
+        Llama a la Azure Function para generar el reporte y envía el resultado al usuario.
+        
+        Args:
+            turn_context (TurnContext): Contexto del turno actual.
+            quarter (str): Trimestre seleccionado (ej. 'Q2').
+            leader_id (str): ID de líder ingresado.
+        """
         azure_function_url = os.getenv("AZURE_FUNCTION_URL", "https://<your-function-app>.azurewebsites.net/api/generate_presentation")
         auth_token = os.getenv("AZURE_FUNCTION_AUTH_TOKEN", "<your-auth-token>")
         
         payload = {
             "q": quarter,
             "matricula_lider": leader_id,
-             "agenda": [
-                "Punto 1 de la agenda",
-                "Punto 2 de la agenda",
-                "Punto 3 de la agenda",
-                "Punto 8 de la agenda",
-                "Punto 9 de la agenda",
-                "Punto 10 de la agenda"
-            ]
+            "tmd_file": "TMD.xlsx",
+            "users_file": "base_equipo.xlsx",
+            "pases_file": "Calidad_pases.xlsx",
+            "revisiones_file": "Reversiones.xlsx",
+            "maturity_level_file": "NIVEL_MADUREZ.xlsx"
         }
         
         try:

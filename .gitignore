@@ -18,3 +18,4 @@ variables.env
 
 # Otros archivos que no quieras subir
 *.log
+agenda.json
