@@ -85,15 +85,6 @@ class ReportBot(ActivityHandler):
             return []
 
     async def generate_agenda_points(self, user_input: str) -> list:
-        """
-        Usa Azure Open AI para convertir el input del usuario en una lista de puntos de agenda cortos.
-
-        Args:
-            user_input (str): Texto ingresado por el usuario.
-
-        Returns:
-            list: Lista de puntos de agenda generados por Open AI (5-10 palabras por punto).
-        """
         prompt = f"""
         Eres un asistente que convierte texto en puntos concisos de agenda.
         Toma este texto y conviértelo en una lista de puntos breves:
@@ -223,8 +214,8 @@ class ReportBot(ActivityHandler):
             await turn_context.send_activity(agenda_message)
             await turn_context.send_activity("¿Confirmas estos cambios?")
             actions = [
-                CardAction(type=ActionTypes.im_back, title="Confirmar cambios", value="Confirmar cambios"),
-                CardAction(type=ActionTypes.im_back, title="Volver al menú inicial", value="Volver al menú inicial"),
+                CardAction(type=ActionTypes.im_back, title="Confirmar y Generar Presentación", value="Confirmar y Generar Presentación"),
+                CardAction(type=ActionTypes.im_back, title="Descartar y volver al inicio", value="Descartar y volver al inicio"),
             ]
             conv_data["state"] = "confirming_agenda_changes"
             await self.conversation_data.set(turn_context, conv_data)
@@ -234,21 +225,25 @@ class ReportBot(ActivityHandler):
             return
 
         if conv_data["state"] == "confirming_agenda_changes":
-            if text == "Confirmar cambios":
-                await turn_context.send_activity("Cambios confirmados. La agenda ha sido actualizada.")
-                conv_data["state"] = "initial"
+            if text == "Confirmar y Generar Presentación":
+                await turn_context.send_activity("Cambios confirmados. Ahora generaremos la presentación.")
+                conv_data["state"] = "selecting_quarter"
                 await self.conversation_data.set(turn_context, conv_data)
+                await turn_context.send_activity("¡Genial! Para el reporte, ¿qué trimestre desea usar?")
                 actions = [
-                    CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
-                    CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
+                    CardAction(type=ActionTypes.im_back, title="Q1", value="Q1"),
+                    CardAction(type=ActionTypes.im_back, title="Q2", value="Q2"),
+                    CardAction(type=ActionTypes.im_back, title="Q3", value="Q3"),
+                    CardAction(type=ActionTypes.im_back, title="Q4", value="Q4"),
                 ]
                 await turn_context.send_activity(
-                    MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
+                    MessageFactory.suggested_actions(actions, "Por favor, selecciona un trimestre:")
                 )
-            elif text == "Volver al menú inicial":
+            elif text == "Descartar y volver al inicio":
                 conv_data["state"] = "initial"
                 conv_data.pop("next_meeting_agenda", None)
                 await self.conversation_data.set(turn_context, conv_data)
+                await turn_context.send_activity("Cambios descartados. Volviendo al menú inicial.")
                 actions = [
                     CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
                     CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
@@ -257,7 +252,7 @@ class ReportBot(ActivityHandler):
                     MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
                 )
             else:
-                await turn_context.send_activity("Por favor, selecciona una opción válida: 'Confirmar cambios' o 'Volver al menú inicial'.")
+                await turn_context.send_activity("Por favor, selecciona una opción válida: 'Confirmar y Generar Presentación' o 'Descartar y volver al inicio'.")
             return
 
         if conv_data["state"] == "selecting_quarter":
