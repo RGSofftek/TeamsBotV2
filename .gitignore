@@ -1,0 +1,14 @@
+# Carpetas de Python
+__pycache__/
+*.py[cod]
+
+# Entornos virtuales
+venv/
+.venv/
+
+# Archivos de entorno
+.env
+variables.env
+
+# Otros
+*.log
