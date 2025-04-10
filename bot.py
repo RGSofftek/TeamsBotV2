@@ -228,11 +228,14 @@ class ReportBot(ActivityHandler):
         payload = {
             "q": quarter,
             "matricula_lider": leader_id,
-            "tmd_file": "TMD.xlsx",
-            "users_file": "base_equipo.xlsx",
-            "pases_file": "Calidad_pases.xlsx",
-            "revisiones_file": "Reversiones.xlsx",
-            "maturity_level_file": "NIVEL_MADUREZ.xlsx"
+            "agenda": [
+                "Punto 1 de la agenda",
+                "Punto 2 de la agenda",
+                "Punto 3 de la agenda",
+                "Punto 8 de la agenda",
+                "Punto 9 de la agenda",
+                "Punto 10 de la agenda"
+            ]
         }
         
         try:
