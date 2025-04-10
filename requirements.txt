@@ -1,0 +1,9 @@
+botbuilder-core
+botbuilder-schema
+botbuilder-dialogs
+pandas
+azure-storage-file-share
+aiohttp
+requests
+openpyxl
+python-dotenv
