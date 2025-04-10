@@ -4,13 +4,14 @@ from io import BytesIO
 from aiohttp import ClientSession
 from azure.storage.fileshare import ShareServiceClient
 import pandas as pd
+from datetime import datetime
 from botbuilder.core import ActivityHandler, TurnContext, MessageFactory, ConversationState
 from botbuilder.schema import SuggestedActions, CardAction, ActionTypes
 
 class ReportBot(ActivityHandler):
     """
     Un bot que saluda al usuario y ofrece opciones iniciales: 'Generar la presentación' y 'Revisar agenda'.
-    Genera reportes usando una Azure Function y muestra agendas desde un archivo JSON.
+    Genera reportes usando una Azure Function y muestra la agenda de la próxima reunión desde un archivo JSON.
     """
 
     def __init__(self, conversation_state: ConversationState):
@@ -121,20 +122,30 @@ class ReportBot(ActivityHandler):
                     if not meetings:
                         await turn_context.send_activity("No hay reuniones programadas en la agenda.")
                     else:
-                        # Construir el mensaje con la agenda
-                        agenda_message = "Aquí está tu agenda:\n\n"
-                        for meeting in meetings:
-                            subject = meeting.get("subject", "Sin título")
-                            start = meeting.get("start", "Sin hora")
-                            agenda_items = meeting.get("body", {}).get("agenda", [])
-                            agenda_message += f"**{subject}** ({start}):\n"
+                        # Obtener la fecha actual en UTC
+                        current_time = datetime.utcnow()
+                        # Filtrar reuniones futuras y encontrar la más próxima
+                        future_meetings = [
+                            m for m in meetings
+                            if datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ") > current_time
+                        ]
+                        if not future_meetings:
+                            await turn_context.send_activity("No hay reuniones futuras en la agenda.")
+                        else:
+                            # Ordenar por fecha de inicio y tomar la primera
+                            next_meeting = min(
+                                future_meetings,
+                                key=lambda m: datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ")
+                            )
+                            subject = next_meeting.get("subject", "Sin título")
+                            start = next_meeting.get("start", "Sin hora")
+                            agenda_items = next_meeting.get("body", {}).get("agenda", [])
+                            agenda_message = f"Agenda de la próxima reunión: **{subject}** ({start}):\n\n"
                             for item in agenda_items:
                                 agenda_message += f"- {item}\n"
-                            agenda_message += "\n"
-                        await turn_context.send_activity(agenda_message)
-                    # Mantener el estado inicial para permitir otra selección
+                            await turn_context.send_activity(agenda_message)
+                    # Mantener el estado inicial y ofrecer opciones
                     await self.conversation_data.set(turn_context, conv_data)
-                    # Ofrecer opciones nuevamente
                     actions = [
                         CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
                         CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
@@ -174,7 +185,6 @@ class ReportBot(ActivityHandler):
                     await turn_context.send_activity(f"¡Genial! Generando tu reporte para {conv_data['quarter']} con el ID de líder {text}...")
                     await turn_context.send_activity("Procesando tu reporte, por favor espera...")
                     await self.call_azure_function(turn_context, conv_data["quarter"], conv_data["leader_id"])
-                    # Reiniciar para la próxima conversación
                     conv_data["quarter"] = None
                     conv_data["leader_id"] = None
                     conv_data["state"] = "initial"
