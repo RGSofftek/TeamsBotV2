@@ -115,16 +115,13 @@ class ReportBot(ActivityHandler):
                 )
             elif text == "Revisar agenda":
                 try:
-                    # Descargar el archivo JSON
                     agenda_data = await self.download_json_from_share("agenda.json")
                     meetings = agenda_data.get("meetings", [])
                     
                     if not meetings:
                         await turn_context.send_activity("No hay reuniones programadas en la agenda.")
                     else:
-                        # Obtener la fecha actual en UTC
                         current_time = datetime.utcnow()
-                        # Filtrar reuniones futuras y encontrar la más próxima
                         future_meetings = [
                             m for m in meetings
                             if datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ") > current_time
@@ -132,7 +129,6 @@ class ReportBot(ActivityHandler):
                         if not future_meetings:
                             await turn_context.send_activity("No hay reuniones futuras en la agenda.")
                         else:
-                            # Ordenar por fecha de inicio y tomar la primera
                             next_meeting = min(
                                 future_meetings,
                                 key=lambda m: datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ")
@@ -144,15 +140,17 @@ class ReportBot(ActivityHandler):
                             for item in agenda_items:
                                 agenda_message += f"- {item}\n"
                             await turn_context.send_activity(agenda_message)
-                    # Mantener el estado inicial y ofrecer opciones
-                    await self.conversation_data.set(turn_context, conv_data)
-                    actions = [
-                        CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
-                        CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
-                    ]
-                    await turn_context.send_activity(
-                        MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
-                    )
+                            await turn_context.send_activity("¿Deseas hacer modificaciones a esta agenda?")
+                            actions = [
+                                CardAction(type=ActionTypes.im_back, title="Realizar modificaciones", value="Realizar modificaciones"),
+                                CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
+                            ]
+                            conv_data["state"] = "awaiting_modification_choice"
+                            conv_data["next_meeting"] = next_meeting
+                            await self.conversation_data.set(turn_context, conv_data)
+                            await turn_context.send_activity(
+                                MessageFactory.suggested_actions(actions, "Selecciona una opción:")
+                            )
                 except Exception as e:
                     error_msg = str(e)
                     if "ResourceNotFound" in error_msg:
@@ -161,6 +159,30 @@ class ReportBot(ActivityHandler):
                         await turn_context.send_activity(f"Error al leer la agenda: {error_msg}. Intenta de nuevo.")
             else:
                 await turn_context.send_activity("Por favor, selecciona una opción válida: 'Generar la presentación' o 'Revisar agenda'.")
+            return
+
+        # Estado: esperando elección sobre modificaciones
+        if conv_data["state"] == "awaiting_modification_choice":
+            if text == "Generar la presentación":
+                conv_data["state"] = "selecting_quarter"
+                conv_data.pop("next_meeting", None)
+                await self.conversation_data.set(turn_context, conv_data)
+                await turn_context.send_activity("¡Genial! Para el reporte, ¿qué trimestre desea usar?")
+                actions = [
+                    CardAction(type=ActionTypes.im_back, title="Q1", value="Q1"),
+                    CardAction(type=ActionTypes.im_back, title="Q2", value="Q2"),
+                    CardAction(type=ActionTypes.im_back, title="Q3", value="Q3"),
+                    CardAction(type=ActionTypes.im_back, title="Q4", value="Q4"),
+                ]
+                await turn_context.send_activity(
+                    MessageFactory.suggested_actions(actions, "Por favor, selecciona un trimestre:")
+                )
+            elif text == "Realizar modificaciones":
+                conv_data["state"] = "modifying_agenda"
+                await self.conversation_data.set(turn_context, conv_data)
+                await turn_context.send_activity("Funcionalidad de modificación en desarrollo. Por favor, dime cómo quieres proceder.")
+            else:
+                await turn_context.send_activity("Por favor, selecciona una opción válida: 'Realizar modificaciones' o 'Generar la presentación'.")
             return
 
         # Estado: seleccionando trimestre
@@ -209,6 +231,11 @@ class ReportBot(ActivityHandler):
                     await turn_context.send_activity("El archivo de usuarios no tiene la columna 'Matricula Lider'. Contacta al administrador.")
                 else:
                     await turn_context.send_activity(f"Error al acceder a los datos de usuarios: {error_msg}. Intenta de nuevo.")
+            return
+        
+        # Estado: modificando agenda (placeholder)
+        if conv_data["state"] == "modifying_agenda":
+            await turn_context.send_activity("Esperando instrucciones para modificar la agenda. ¿Qué quieres hacer?")
             return
         
         await turn_context.send_activity("No entendí eso. Por favor selecciona una opción o sigue el flujo.")
