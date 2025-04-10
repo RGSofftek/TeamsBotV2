@@ -7,3 +7,4 @@ aiohttp
 requests
 openpyxl
 python-dotenv
+azure-ai-inference
