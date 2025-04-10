@@ -14,6 +14,7 @@ class ReportBot(ActivityHandler):
     """
     Un bot que saluda al usuario y ofrece opciones iniciales: 'Generar la presentación' y 'Revisar agenda'.
     Permite modificar la agenda de la próxima reunión usando Azure Open AI y genera reportes con la agenda actualizada.
+    Incluye los nombres de nuevos miembros del equipo en el payload para la Azure Function.
     """
 
     def __init__(self, conversation_state: ConversationState):
@@ -108,6 +109,29 @@ class ReportBot(ActivityHandler):
             return points
         except Exception as e:
             return ["Error al generar puntos de agenda."]
+
+    async def get_new_team_members(self, leader_id: str) -> list:
+        """
+        Obtiene los nombres completos de los nuevos miembros del equipo de un líder.
+
+        Args:
+            leader_id (str): Matrícula del líder.
+
+        Returns:
+            list: Lista de nombres completos de los nuevos miembros.
+        """
+        try:
+            users_df = await self.download_file_from_share("Tabla_de_Usuarios_Actualizada.xlsx")
+            # Filtrar miembros del equipo del líder
+            team_members = users_df[users_df['Matricula Lider'].astype(str) == leader_id]
+            # Filtrar nuevos miembros (TRUE en "Nuevo miembro")
+            new_members = team_members[team_members['Nuevo miembro'] == True]  # noqa: E712
+            # Obtener nombres completos
+            new_member_names = new_members['Nombre Completo'].tolist()
+            return new_member_names
+        except Exception as e:
+            error_msg = str(e)
+            return []
 
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         for member in members_added:
@@ -274,9 +298,11 @@ class ReportBot(ActivityHandler):
                 valid_leaders = users_df['Matricula Lider'].astype(str).tolist()
                 if text in valid_leaders:
                     conv_data["leader_id"] = text
+                    # Obtener los nombres de los nuevos miembros
+                    new_members = await self.get_new_team_members(text)
                     await turn_context.send_activity(f"¡Genial! Generando tu reporte para {conv_data['quarter']} con el ID de líder {text}...")
                     await turn_context.send_activity("Procesando tu reporte, por favor espera...")
-                    await self.call_azure_function(turn_context, conv_data["quarter"], conv_data["leader_id"], conv_data.get("next_meeting_agenda", []))
+                    await self.call_azure_function(turn_context, conv_data["quarter"], conv_data["leader_id"], conv_data.get("next_meeting_agenda", []), new_members)
                     conv_data["quarter"] = None
                     conv_data["leader_id"] = None
                     conv_data["state"] = "initial"
@@ -302,14 +328,15 @@ class ReportBot(ActivityHandler):
 
         await turn_context.send_activity("No entendí eso. Por favor selecciona una opción o sigue el flujo.")
 
-    async def call_azure_function(self, turn_context: TurnContext, quarter: str, leader_id: str, agenda: list):
+    async def call_azure_function(self, turn_context: TurnContext, quarter: str, leader_id: str, agenda: list, new_members: list):
         azure_function_url = os.getenv("AZURE_FUNCTION_URL", "https://<your-function-app>.azurewebsites.net/api/generate_presentation")
         auth_token = os.getenv("AZURE_FUNCTION_AUTH_TOKEN", "<your-auth-token>")
 
         payload = {
             "q": quarter,
             "matricula_lider": leader_id,
-            "agenda": agenda if agenda else ["Punto 1 de la agenda", "Punto 2 de la agenda"]
+            "agenda": agenda if agenda else ["Punto 1 de la agenda", "Punto 2 de la agenda"],
+            "nuevos_miembros": new_members
         }
 
         try:
