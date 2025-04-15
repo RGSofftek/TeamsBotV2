@@ -53,21 +53,41 @@ class ReportBot(ActivityHandler):
         Returns:
             str: Contenido del archivo.
         """
-        directory_client = self.share_client.get_directory_client(directory)
-        file_client = directory_client.get_file_client(filename)
-        stream = file_client.download_file()
-        content = stream.readall().decode('utf-8')
-        return content
+        try:
+            directory_client = self.share_client.get_directory_client(directory)
+            file_client = directory_client.get_file_client(filename)
+            stream = file_client.download_file()
+            content = stream.readall().decode('utf-8')
+            return content
+        except Exception as e:
+            raise Exception(f"Error downloading file {filename}: {str(e)}")
 
     async def download_json_from_share(self, filename: str) -> dict:
-        directory_client = self.share_client.get_directory_client(self.inputs_directory)
-        file_client = directory_client.get_file_client(filename)
-        stream = file_client.download_file()
-        with BytesIO(stream.readall()) as f:
-            data = json.load(f)
-        return data
+        """
+        Descarga un archivo JSON desde Azure File Storage y lo parsea.
+        
+        Args:
+            filename (str): Nombre del archivo JSON.
+        
+        Returns:
+            dict: Contenido del archivo parseado.
+        """
+        try:
+            content = await self.download_file_from_share(filename, self.inputs_directory)
+            return json.loads(content)
+        except Exception as e:
+            raise Exception(f"Error parsing JSON file {filename}: {str(e)}")
 
     async def get_next_meeting_agenda(self, turn_context: TurnContext) -> list:
+        """
+        Obtiene la agenda de la próxima reunión desde agenda.json.
+        
+        Args:
+            turn_context (TurnContext): Contexto para enviar mensajes.
+        
+        Returns:
+            list: Puntos de la agenda.
+        """
         try:
             agenda_data = await self.download_json_from_share("agenda.json")
             meetings = agenda_data.get("meetings", [])
@@ -98,14 +118,13 @@ class ReportBot(ActivityHandler):
     async def generate_agenda_points(self, user_input: str) -> list:
         """
         Convierte la entrada del usuario en una lista de puntos de agenda.
-        El usuario debe ingresar puntos separados por líneas o comas.
         Valida que cada punto tenga entre 1 y 20 palabras y capitaliza la primera letra.
         
         Args:
             user_input (str): Texto con puntos de agenda separados por líneas o comas.
         
         Returns:
-            list: Lista de puntos de agenda válidos o mensajes de error.
+            list: Lista de puntos válidos o mensajes de error.
         """
         if not user_input.strip():
             return ["La entrada no puede estar vacía."]
@@ -122,10 +141,8 @@ class ReportBot(ActivityHandler):
         valid_points = []
         for point in points:
             word_count = len(point.split())
-            # Verificar que el punto contenga al menos una letra o palabra válida
             has_valid_content = any(c.isalpha() for c in point)
             if 1 <= word_count <= 20 and has_valid_content:
-                # Capitalizar la primera letra
                 capitalized_point = point[0].upper() + point[1:] if point else point
                 valid_points.append(capitalized_point)
             else:
@@ -148,14 +165,12 @@ class ReportBot(ActivityHandler):
             turn_context (TurnContext): Contexto para enviar mensajes de error.
         """
         try:
-            # Leer el archivo agenda.json existente
             agenda_data = await self.download_json_from_share("agenda.json")
             meetings = agenda_data.get("meetings", [])
             if not meetings:
                 await turn_context.send_activity("No hay reuniones programadas para actualizar.")
                 return
             
-            # Encontrar la próxima reunión
             current_time = datetime.utcnow()
             future_meetings = [
                 m for m in meetings
@@ -170,19 +185,26 @@ class ReportBot(ActivityHandler):
                 key=lambda m: datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ")
             )
             
-            # Actualizar la agenda de la próxima reunión
             next_meeting["body"] = next_meeting.get("body", {})
             next_meeting["body"]["agenda"] = agenda
             
-            # Guardar el archivo actualizado
             directory_client = self.share_client.get_directory_client(self.inputs_directory)
             file_client = directory_client.get_file_client("agenda.json")
-            file_client.upload_file(json.dumps(agenda_data, ensure_ascii=False).encode('utf-8'), overwrite=True)
+            file_client.upload_file(json.dumps(agenda_data, ensure_ascii=False).encode('utf-8'))
         except Exception as e:
             error_msg = str(e)
             await turn_context.send_activity(f"Error al guardar la agenda: {error_msg}.")
 
     async def get_new_team_members(self, leader_id: str) -> list:
+        """
+        Obtiene la lista de nuevos miembros del equipo desde un archivo Excel.
+        
+        Args:
+            leader_id (str): ID del líder.
+        
+        Returns:
+            list: Nombres de nuevos miembros.
+        """
         try:
             users_df = await self.download_file_from_share("Tabla_de_Usuarios_Actualizada.xlsx", self.inputs_directory)
             team_members = users_df[users_df['Matrícula Líder'].astype(str) == leader_id]
@@ -194,6 +216,13 @@ class ReportBot(ActivityHandler):
             return []
 
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
+        """
+        Maneja la adición de nuevos miembros a la conversación.
+        
+        Args:
+            members_added: Lista de miembros añadidos.
+            turn_context (TurnContext): Contexto de la conversación.
+        """
         for member in members_added:
             if member.id != turn_context.activity.recipient.id:
                 await turn_context.send_activity("¡Hola! ¿Qué te gustaría hacer hoy?")
@@ -211,8 +240,20 @@ class ReportBot(ActivityHandler):
                 )
 
     async def on_message_activity(self, turn_context: TurnContext):
+        """
+        Maneja los mensajes del usuario según el estado conversacional.
+        
+        Args:
+            turn_context (TurnContext): Contexto de la conversación.
+        """
         text = turn_context.activity.text.strip()
-        conv_data = await self.conversation_data.get(turn_context, {"quarter": None, "state": "initial", "next_meeting_agenda": None, "session_content": None})
+        conv_data = await self.conversation_data.get(turn_context, {
+            "quarter": None,
+            "state": "initial",
+            "next_meeting_agenda": None,
+            "session_content": None,
+            "agenda_change_history": []
+        })
 
         if conv_data["state"] == "initial":
             if self.junta_enabled and text == "Revisar contenido de la sesión":
@@ -321,6 +362,21 @@ class ReportBot(ActivityHandler):
                     "\nPor favor, ingresa puntos con 1-20 palabras y que contengan letras."
                 )
                 return
+            
+            # Registrar el cambio en el historial
+            old_agenda = conv_data.get("next_meeting_agenda", []).copy()
+            modification_type = "rewrite" if conv_data["modification_type"] == "Reescribir toda la agenda" else "append"
+            new_agenda = new_points if modification_type == "rewrite" else old_agenda + new_points
+            change_entry = {
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "modification_type": modification_type,
+                "old_agenda": old_agenda,
+                "new_agenda": new_agenda,
+                "added_points": new_points if modification_type == "append" else []
+            }
+            conv_data["agenda_change_history"].append(change_entry)
+            
+            # Actualizar la agenda
             if conv_data["modification_type"] == "Reescribir toda la agenda":
                 conv_data["next_meeting_agenda"] = new_points
             else:
@@ -343,9 +399,7 @@ class ReportBot(ActivityHandler):
 
         if conv_data["state"] == "confirming_agenda_changes":
             if text == "Confirmar y Generar Presentación":
-                await turn_context.send_activity("Cambios confirmados. Guardando la agenda...")
-                await self.save_agenda_to_share(conv_data["next_meeting_agenda"], turn_context)
-                await turn_context.send_activity("Ahora generaremos la presentación.")
+                await turn_context.send_activity("Cambios confirmados.")
                 conv_data["state"] = "selecting_quarter"
                 await self.conversation_data.set(turn_context, conv_data)
                 await turn_context.send_activity("¡Genial! Para el reporte, ¿qué trimestre desea usar?")
@@ -360,7 +414,8 @@ class ReportBot(ActivityHandler):
                 )
             elif text == "Descartar y volver al inicio":
                 conv_data["state"] = "initial"
-                conv_data.pop("next_meeting_agenda", None)
+                conv_data["next_meeting_agenda"] = None
+                conv_data["agenda_change_history"] = []
                 await self.conversation_data.set(turn_context, conv_data)
                 await turn_context.send_activity("Cambios descartados. Volviendo al menú inicial.")
                 if self.junta_enabled:
@@ -381,31 +436,118 @@ class ReportBot(ActivityHandler):
 
         if conv_data["state"] == "selecting_quarter":
             text_upper = text.upper()
-            if text_upper in ["Q1", "Q2", "Q3", "Q4"]:
-                conv_data["quarter"] = text_upper
-                new_members = await self.get_new_team_members(self.leader_id)
-                if "next_meeting_agenda" not in conv_data or not conv_data["next_meeting_agenda"]:
-                    conv_data["next_meeting_agenda"] = await self.get_next_meeting_agenda(turn_context)
-                await turn_context.send_activity(f"¡Genial! Generando tu reporte para {text_upper} con el ID de líder {self.leader_id}...")
-                await turn_context.send_activity("Procesando tu reporte, por favor espera...")
-                await self.call_azure_function(turn_context, conv_data["quarter"], self.leader_id, conv_data.get("next_meeting_agenda", []), new_members)
-                conv_data["quarter"] = None
-                conv_data["state"] = "initial"
-                conv_data.pop("next_meeting_agenda", None)
-                await self.conversation_data.set(turn_context, conv_data)
-                await turn_context.send_activity("Reporte generado. ¿Qué más puedo hacer por ti?")
-                if self.junta_enabled:
-                    actions = [
-                        CardAction(type=ActionTypes.im_back, title="Revisar contenido de la sesión", value="Revisar contenido de la sesión")
-                    ]
-                else:
+            if text_upper == "REINTENTAR":
+                if not conv_data.get("next_meeting_agenda"):
+                    await turn_context.send_activity("No hay cambios de agenda para reintentar. Por favor, revisa la agenda nuevamente.")
+                    conv_data["state"] = "initial"
+                    await self.conversation_data.set(turn_context, conv_data)
                     actions = [
                         CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
                         CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
                     ]
+                    await turn_context.send_activity(
+                        MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
+                    )
+                    return
+                await turn_context.send_activity(f"Reintentando generar el reporte para {conv_data['quarter']}...")
+                await turn_context.send_activity("Procesando tu reporte, por favor espera...")
+                success = await self.call_azure_function(
+                    turn_context,
+                    conv_data["quarter"],
+                    self.leader_id,
+                    conv_data.get("next_meeting_agenda", []),
+                    await self.get_new_team_members(self.leader_id)
+                )
+                if success:
+                    if conv_data.get("next_meeting_agenda"):
+                        await self.save_agenda_to_share(conv_data["next_meeting_agenda"], turn_context)
+                        await turn_context.send_activity("Reporte generado y agenda actualizada.")
+                    else:
+                        await turn_context.send_activity("Reporte generado.")
+                    conv_data["quarter"] = None
+                    conv_data["state"] = "initial"
+                    conv_data["next_meeting_agenda"] = None
+                    conv_data["agenda_change_history"] = []
+                    await self.conversation_data.set(turn_context, conv_data)
+                    actions = [
+                        CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
+                        CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
+                    ]
+                    await turn_context.send_activity(
+                        MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
+                    )
+                else:
+                    await turn_context.send_activity("Error al generar la presentación. La agenda no se guardó.")
+                    actions = [
+                        CardAction(type=ActionTypes.im_back, title="Reintentar", value="Reintentar"),
+                        CardAction(type=ActionTypes.im_back, title="Volver al inicio", value="Volver al inicio"),
+                    ]
+                    await turn_context.send_activity(
+                        MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
+                    )
+                return
+            elif text_upper == "VOLVER AL INICIO":
+                conv_data["state"] = "initial"
+                conv_data["next_meeting_agenda"] = None
+                conv_data["agenda_change_history"] = []
+                await self.conversation_data.set(turn_context, conv_data)
+                await turn_context.send_activity("Volviendo al menú inicial.")
+                actions = [
+                    CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
+                    CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
+                ]
                 await turn_context.send_activity(
                     MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
                 )
+                return
+            elif text_upper in ["Q1", "Q2", "Q3", "Q4"]:
+                conv_data["quarter"] = text_upper
+                await self.conversation_data.set(turn_context, conv_data)
+                await turn_context.send_activity(f"¡Genial! Generando tu reporte para {text_upper} con el ID de líder {self.leader_id}...")
+                await turn_context.send_activity("Procesando tu reporte, por favor espera...")
+                new_members = await self.get_new_team_members(self.leader_id)
+                if not conv_data.get("next_meeting_agenda"):
+                    conv_data["next_meeting_agenda"] = await self.get_next_meeting_agenda(turn_context)
+                success = await self.call_azure_function(
+                    turn_context,
+                    conv_data["quarter"],
+                    self.leader_id,
+                    conv_data.get("next_meeting_agenda", []),
+                    new_members
+                )
+                if success:
+                    if conv_data.get("next_meeting_agenda"):
+                        await self.save_agenda_to_share(conv_data["next_meeting_agenda"], turn_context)
+                        await turn_context.send_activity("Reporte generado y agenda actualizada.")
+                    else:
+                        await turn_context.send_activity("Reporte generado.")
+                    conv_data["quarter"] = None
+                    conv_data["state"] = "initial"
+                    conv_data["next_meeting_agenda"] = None
+                    conv_data["agenda_change_history"] = []
+                    await self.conversation_data.set(turn_context, conv_data)
+                    if self.junta_enabled:
+                        actions = [
+                            CardAction(type=ActionTypes.im_back, title="Revisar contenido de la sesión", value="Revisar contenido de la sesión")
+                        ]
+                    else:
+                        actions = [
+                            CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
+                            CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
+                        ]
+                    await turn_context.send_activity(
+                        MessageFactory.suggested_actions(actions, "¿Qué más puedo hacer por ti?:")
+                    )
+                else:
+                    await turn_context.send_activity("Error al generar la presentación. La agenda no se guardó.")
+                    actions = [
+                        CardAction(type=ActionTypes.im_back, title="Reintentar", value="Reintentar"),
+                        CardAction(type=ActionTypes.im_back, title="Volver al inicio", value="Volver al inicio"),
+                    ]
+                    await turn_context.send_activity(
+                        MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
+                    )
+                return
             else:
                 await turn_context.send_activity("Por favor, selecciona un trimestre válido (Q1, Q2, Q3 o Q4).")
             return
@@ -415,6 +557,9 @@ class ReportBot(ActivityHandler):
     async def ask_for_changes(self, turn_context: TurnContext):
         """
         Pregunta al usuario si desea hacer cambios al contenido de la sesión.
+        
+        Args:
+            turn_context (TurnContext): Contexto de la conversación.
         """
         actions = [
             CardAction(type=ActionTypes.im_back, title="Sí", value="Sí"),
@@ -427,7 +572,20 @@ class ReportBot(ActivityHandler):
         conv_data["state"] = "reviewing_session_content"
         await self.conversation_data.set(turn_context, conv_data)
 
-    async def call_azure_function(self, turn_context: TurnContext, quarter: str, leader_id: str, agenda: list, new_members: list):
+    async def call_azure_function(self, turn_context: TurnContext, quarter: str, leader_id: str, agenda: list, new_members: list) -> bool:
+        """
+        Llama a una Azure Function para generar un reporte y devuelve si fue exitoso.
+        
+        Args:
+            turn_context (TurnContext): Contexto para enviar mensajes.
+            quarter (str): Trimestre del reporte.
+            leader_id (str): ID del líder.
+            agenda (list): Puntos de la agenda.
+            new_members (list): Nuevos miembros del equipo.
+        
+        Returns:
+            bool: True si la generación fue exitosa, False en caso contrario.
+        """
         azure_function_url = os.getenv("AZURE_FUNCTION_URL", "https://<your-function-app>.azurewebsites.net/api/generate_presentation")
         auth_token = os.getenv("AZURE_FUNCTION_AUTH_TOKEN", "<your-auth-token>")
 
@@ -463,7 +621,10 @@ class ReportBot(ActivityHandler):
                             }
                         }
                         await turn_context.send_activity(MessageFactory.attachment(hero_card))
+                        return True
                     else:
-                        await turn_context.send_activity("Lo siento, ocurrió un error al generar tu reporte. Intenta de nuevo más tarde.")
+                        await turn_context.send_activity("Lo siento, ocurrió un error al generar tu reporte.")
+                        return False
         except Exception as e:
-            await turn_context.send_activity("Ocurrió un error inesperado al procesar tu solicitud. Por favor, intenta de nuevo más tarde.")
+            await turn_context.send_activity(f"Ocurrió un error inesperado: {str(e)}")
+            return False
