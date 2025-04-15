@@ -156,12 +156,13 @@ class ReportBot(ActivityHandler):
         
         return valid_points
 
-    async def save_agenda_to_share(self, agenda: list, turn_context: TurnContext):
+    async def save_agenda_to_share(self, agenda: list, change_history: list, turn_context: TurnContext):
         """
-        Guarda la agenda actualizada en agenda.json en Azure File Storage.
+        Guarda la agenda actualizada y el historial de cambios en agenda.json.
         
         Args:
             agenda (list): Lista de puntos de la agenda a guardar.
+            change_history (list): Historial de cambios a persistir.
             turn_context (TurnContext): Contexto para enviar mensajes de error.
         """
         try:
@@ -187,6 +188,9 @@ class ReportBot(ActivityHandler):
             
             next_meeting["body"] = next_meeting.get("body", {})
             next_meeting["body"]["agenda"] = agenda
+            
+            # Actualizar el historial de cambios
+            agenda_data["change_history"] = agenda_data.get("change_history", []) + change_history
             
             directory_client = self.share_client.get_directory_client(self.inputs_directory)
             file_client = directory_client.get_file_client("agenda.json")
@@ -460,7 +464,7 @@ class ReportBot(ActivityHandler):
                 )
                 if success:
                     if conv_data.get("next_meeting_agenda"):
-                        await self.save_agenda_to_share(conv_data["next_meeting_agenda"], turn_context)
+                        await self.save_agenda_to_share(conv_data["next_meeting_agenda"], conv_data["agenda_change_history"], turn_context)
                         await turn_context.send_activity("Reporte generado y agenda actualizada.")
                     else:
                         await turn_context.send_activity("Reporte generado.")
@@ -517,7 +521,7 @@ class ReportBot(ActivityHandler):
                 )
                 if success:
                     if conv_data.get("next_meeting_agenda"):
-                        await self.save_agenda_to_share(conv_data["next_meeting_agenda"], turn_context)
+                        await self.save_agenda_to_share(conv_data["next_meeting_agenda"], conv_data["agenda_change_history"], turn_context)
                         await turn_context.send_activity("Reporte generado y agenda actualizada.")
                     else:
                         await turn_context.send_activity("Reporte generado.")
