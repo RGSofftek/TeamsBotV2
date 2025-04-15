@@ -5,8 +5,6 @@ from aiohttp import ClientSession
 from azure.storage.fileshare import ShareServiceClient
 import pandas as pd
 from datetime import datetime
-from azure.ai.inference import ChatCompletionsClient
-from azure.core.credentials import AzureKeyCredential
 from botbuilder.core import ActivityHandler, TurnContext, MessageFactory, ConversationState
 from botbuilder.schema import SuggestedActions, CardAction, ActionTypes
 
@@ -14,7 +12,7 @@ class ReportBot(ActivityHandler):
     """
     Un bot que saluda al usuario y ofrece opciones iniciales basadas en la variable de entorno JUNTA.
     Si JUNTA=TRUE, solo muestra 'Revisar contenido de la sesión'. Si JUNTA=FALSE, muestra 'Generar la presentación' y 'Revisar agenda'.
-    Permite modificar la agenda o el contenido de la sesión usando Azure Open AI y genera reportes con la agenda actualizada.
+    Permite modificar la agenda o el contenido de la sesión y genera reportes con la agenda actualizada.
     """
 
     def __init__(self, conversation_state: ConversationState):
@@ -28,19 +26,10 @@ class ReportBot(ActivityHandler):
         self.file_share_name = os.getenv("FILE_SHARE_NAME")
         self.directory_name = os.getenv("DIRECTORY_NAME", "reports")
         self.inputs_directory = f"{self.directory_name}/inputs"
-        self.meeting_transcripts_directory = f"{self.directory_name}/meeting_transcripts"  # Carpeta directa en el file share
+        self.meeting_transcripts_directory = f"{self.directory_name}/meeting_transcripts"
         self.service_url = f"https://{self.storage_account_name}.file.core.windows.net"
         self.service_client = ShareServiceClient(account_url=self.service_url, credential=self.sas_token)
         self.share_client = self.service_client.get_share_client(self.file_share_name)
-
-        # Configuración de Azure Open AI
-        api_key = os.getenv("AZURE_OPENAI_KEY")
-        base_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT").rstrip("/")
-        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
-        self.openai_client = ChatCompletionsClient(
-            endpoint=f"{base_endpoint}/openai/deployments/{deployment_name}",
-            credential=AzureKeyCredential(api_key)
-        )
 
         # Obtener la matrícula del líder desde la variable de entorno
         self.leader_id = os.getenv("LEADER_ID")
@@ -107,71 +96,97 @@ class ReportBot(ActivityHandler):
             return []
 
     async def generate_agenda_points(self, user_input: str) -> list:
-        prompt = f"""
-        Eres un asistente que convierte texto en puntos concisos de agenda.
-        Toma este texto y conviértelo en una lista de puntos breves:
-        "{user_input}"
-        Cada punto debe tener entre 5 y 10 palabras.
-        Responde solo con la lista, un punto por línea, sin numeración ni etiquetas.
         """
-        payload = {
-            "messages": [
-                {"role": "system", "content": "Convierte el texto en puntos de agenda concisos."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 100,
-            "temperature": 0.7,
-            "top_p": 1.0
-        }
-        try:
-            response = self.openai_client.complete(payload)
-            text = response.choices[0].message.content.strip()
-            points = [point.strip() for point in text.split("\n") if point.strip()]
-            return points
-        except Exception as e:
-            return ["Error al generar puntos de agenda."]
-
-    async def modify_session_content(self, current_content: str, user_input: str) -> str:
-        """
-        Usa Azure Open AI para modificar el contenido de la sesión basado en las instrucciones del usuario.
+        Convierte la entrada del usuario en una lista de puntos de agenda.
+        El usuario debe ingresar puntos separados por líneas o comas.
+        Valida que cada punto tenga entre 1 y 20 palabras y capitaliza la primera letra.
         
         Args:
-            current_content (str): Contenido actual de la sesión.
-            user_input (str): Instrucciones del usuario para modificar el contenido.
+            user_input (str): Texto con puntos de agenda separados por líneas o comas.
         
         Returns:
-            str: Contenido modificado.
+            list: Lista de puntos de agenda válidos o mensajes de error.
         """
-        prompt = f"""
-        Eres un asistente que modifica contenido basado en instrucciones. Aquí está el contenido actual:
-        "{current_content}"
+        if not user_input.strip():
+            return ["La entrada no puede estar vacía."]
+        
+        points = []
+        if "\n" in user_input:
+            points = [p.strip() for p in user_input.split("\n") if p.strip()]
+        else:
+            points = [p.strip() for p in user_input.split(",") if p.strip()]
+        
+        if len(points) > 10:
+            return ["Demasiados puntos. Máximo 10 permitidos."]
+        
+        valid_points = []
+        for point in points:
+            word_count = len(point.split())
+            # Verificar que el punto contenga al menos una letra o palabra válida
+            has_valid_content = any(c.isalpha() for c in point)
+            if 1 <= word_count <= 20 and has_valid_content:
+                # Capitalizar la primera letra
+                capitalized_point = point[0].upper() + point[1:] if point else point
+                valid_points.append(capitalized_point)
+            else:
+                if not has_valid_content:
+                    valid_points.append(f"Punto inválido (debe contener letras): {point}")
+                else:
+                    valid_points.append(f"Punto inválido (requiere 1-20 palabras): {point}")
+        
+        if not valid_points:
+            return ["No se proporcionaron puntos de agenda válidos."]
+        
+        return valid_points
 
-        Instrucciones de modificación:
-        "{user_input}"
-
-        Devuelve el contenido modificado en el mismo formato que se te envió, preservando la estructura de secciones, títulos, subtítulos, viñetas y espaciado.
+    async def save_agenda_to_share(self, agenda: list, turn_context: TurnContext):
         """
-        payload = {
-            "messages": [
-                {"role": "system", "content": "Modifica el contenido según las instrucciones, manteniendo el formato original."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 1000,
-            "temperature": 0.7,
-            "top_p": 1.0
-        }
+        Guarda la agenda actualizada en agenda.json en Azure File Storage.
+        
+        Args:
+            agenda (list): Lista de puntos de la agenda a guardar.
+            turn_context (TurnContext): Contexto para enviar mensajes de error.
+        """
         try:
-            response = self.openai_client.complete(payload)
-            modified_content = response.choices[0].message.content.strip()
-            return modified_content
+            # Leer el archivo agenda.json existente
+            agenda_data = await self.download_json_from_share("agenda.json")
+            meetings = agenda_data.get("meetings", [])
+            if not meetings:
+                await turn_context.send_activity("No hay reuniones programadas para actualizar.")
+                return
+            
+            # Encontrar la próxima reunión
+            current_time = datetime.utcnow()
+            future_meetings = [
+                m for m in meetings
+                if datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ") > current_time
+            ]
+            if not future_meetings:
+                await turn_context.send_activity("No hay reuniones futuras para actualizar.")
+                return
+            
+            next_meeting = min(
+                future_meetings,
+                key=lambda m: datetime.strptime(m["start"], "%Y-%m-%dT%H:%M:%SZ")
+            )
+            
+            # Actualizar la agenda de la próxima reunión
+            next_meeting["body"] = next_meeting.get("body", {})
+            next_meeting["body"]["agenda"] = agenda
+            
+            # Guardar el archivo actualizado
+            directory_client = self.share_client.get_directory_client(self.inputs_directory)
+            file_client = directory_client.get_file_client("agenda.json")
+            file_client.upload_file(json.dumps(agenda_data, ensure_ascii=False).encode('utf-8'), overwrite=True)
         except Exception as e:
-            return "Error al modificar el contenido."
+            error_msg = str(e)
+            await turn_context.send_activity(f"Error al guardar la agenda: {error_msg}.")
 
     async def get_new_team_members(self, leader_id: str) -> list:
         try:
             users_df = await self.download_file_from_share("Tabla_de_Usuarios_Actualizada.xlsx", self.inputs_directory)
             team_members = users_df[users_df['Matrícula Líder'].astype(str) == leader_id]
-            new_members = team_members[team_members['Nuevo miembro'] == True]  # noqa: E712
+            new_members = team_members[team_members['Nuevo miembro'] == True]
             new_member_names = new_members['Nombre Completo'].tolist()
             return new_member_names
         except Exception as e:
@@ -202,7 +217,6 @@ class ReportBot(ActivityHandler):
         if conv_data["state"] == "initial":
             if self.junta_enabled and text == "Revisar contenido de la sesión":
                 try:
-                    # Leer el archivo test_processed.txt desde meeting_transcripts
                     content = await self.download_file_from_share("test_processed.txt", self.meeting_transcripts_directory)
                     conv_data["session_content"] = content
                     await self.conversation_data.set(turn_context, conv_data)
@@ -252,42 +266,6 @@ class ReportBot(ActivityHandler):
                 await turn_context.send_activity("Por favor, selecciona una opción válida.")
             return
 
-        if conv_data["state"] == "reviewing_session_content":
-            if text == "Sí":
-                await turn_context.send_activity("Por favor, describe los cambios que deseas hacer al contenido.")
-                conv_data["state"] = "awaiting_content_input"
-                await self.conversation_data.set(turn_context, conv_data)
-            elif text == "Proceder al envío":
-                await turn_context.send_activity("Enviando el correo a tu equipo.")
-                conv_data["state"] = "initial"
-                conv_data.pop("session_content", None)
-                await self.conversation_data.set(turn_context, conv_data)
-                if self.junta_enabled:
-                    actions = [
-                        CardAction(type=ActionTypes.im_back, title="Revisar contenido de la sesión", value="Revisar contenido de la sesión")
-                    ]
-                else:
-                    actions = [
-                        CardAction(type=ActionTypes.im_back, title="Generar la presentación", value="Generar la presentación"),
-                        CardAction(type=ActionTypes.im_back, title="Revisar agenda", value="Revisar agenda"),
-                    ]
-                await turn_context.send_activity(
-                    MessageFactory.suggested_actions(actions, "Por favor, selecciona una opción:")
-                )
-            else:
-                await turn_context.send_activity("Por favor, selecciona una opción válida: 'Sí' o 'Proceder al envío'.")
-            return
-
-        if conv_data["state"] == "awaiting_content_input":
-            user_input = text
-            current_content = conv_data.get("session_content", "")
-            modified_content = await self.modify_session_content(current_content, user_input)
-            conv_data["session_content"] = modified_content
-            await self.conversation_data.set(turn_context, conv_data)
-            await turn_context.send_activity(f"Este es el contenido generado a partir de la transcripción de la reunión con los cambios que sugeriste:\n\n{modified_content}")
-            await self.ask_for_changes(turn_context)
-            return
-
         if conv_data["state"] == "awaiting_modification_choice":
             if text == "Generar la presentación":
                 conv_data["state"] = "selecting_quarter"
@@ -321,7 +299,11 @@ class ReportBot(ActivityHandler):
             if text in ["Reescribir toda la agenda", "Mantener los puntos anteriores y agregar nuevos"]:
                 conv_data["modification_type"] = text
                 await self.conversation_data.set(turn_context, conv_data)
-                await turn_context.send_activity("Por favor, describe los cambios que deseas hacer a la agenda.")
+                await turn_context.send_activity(
+                    "Por favor, ingresa los puntos de la agenda, uno por línea o separados por comas. "
+                    "Cada punto debe tener entre 1 y 20 palabras y contener letras. "
+                    "Ejemplo: 'Discutir metas del equipo, Revisar presupuesto trimestral'."
+                )
                 conv_data["state"] = "awaiting_agenda_input"
                 await self.conversation_data.set(turn_context, conv_data)
             else:
@@ -331,6 +313,14 @@ class ReportBot(ActivityHandler):
         if conv_data["state"] == "awaiting_agenda_input":
             user_input = text
             new_points = await self.generate_agenda_points(user_input)
+            invalid_points = [p for p in new_points if p.startswith("Punto inválido") or p.startswith("Demasiados puntos") or p.startswith("La entrada no puede")]
+            if invalid_points:
+                await turn_context.send_activity(
+                    "Algunos puntos no cumplen los requisitos:\n" +
+                    "\n".join(invalid_points) +
+                    "\nPor favor, ingresa puntos con 1-20 palabras y que contengan letras."
+                )
+                return
             if conv_data["modification_type"] == "Reescribir toda la agenda":
                 conv_data["next_meeting_agenda"] = new_points
             else:
@@ -353,7 +343,9 @@ class ReportBot(ActivityHandler):
 
         if conv_data["state"] == "confirming_agenda_changes":
             if text == "Confirmar y Generar Presentación":
-                await turn_context.send_activity("Cambios confirmados. Ahora generaremos la presentación.")
+                await turn_context.send_activity("Cambios confirmados. Guardando la agenda...")
+                await self.save_agenda_to_share(conv_data["next_meeting_agenda"], turn_context)
+                await turn_context.send_activity("Ahora generaremos la presentación.")
                 conv_data["state"] = "selecting_quarter"
                 await self.conversation_data.set(turn_context, conv_data)
                 await turn_context.send_activity("¡Genial! Para el reporte, ¿qué trimestre desea usar?")
